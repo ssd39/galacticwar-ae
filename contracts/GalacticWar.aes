@@ -1,0 +1,205 @@
+@compiler >= 6
+
+include "Option.aes"
+include "String.aes"
+include "List.aes"
+include "Pair.aes"
+include "./GameAsset.aes"
+include "./Aureus.aes"
+
+//level 1 clan contract
+main contract GalacticWar = 
+    
+    record state = { owner : address,
+        aureus: Aureus,
+        assets_count : int,
+        assets : assets_map,
+        game_state : game_state_map,
+        users : users_map,
+        user_count: int,
+        asset_cordinates: asset_cordinates_map,
+        war_state: war_state_map,
+        war_result_oracle: option(oracle(war_oracle_question, war_oracle_result))}
+    
+    record war = {
+        attacker: address,
+        defense: address,
+        is_finished: bool }
+    
+    record war_oracle_question = {
+        game_id : string }
+
+    record war_oracle_result = {
+        game_id: string,
+        destroyed_building: int,
+        killed_troops: int }
+
+    type assets_map = map(int, GameAsset)
+    type users_map = map(int, address)
+    type game_state_map = map(address, bool)
+    type asset_cordinates_map = map(address, map(int, list(list(int))))
+    type asset_cordinates_map_internal = map(int, list(list(int)))
+    type asset_kv = (int * list(list(int)))
+    type war_data = (string * address * asset_cordinates_map_internal)
+    type war_state_map =  map(string, war)
+    type asset_id_instance = (int * GameAsset)
+
+    stateful entrypoint init() =
+        let town_hall = Chain.create("TownHall", "TH", "", 0) : GameAsset
+        let miner = Chain.create("Miner", "MN", "", 150) : GameAsset
+        let cannon = Chain.create("Cannon", "CC", "", 450) : GameAsset
+        let xbow = Chain.create("Xbow", "XB", "", 350) : GameAsset
+        let tesla = Chain.create("Tesla", "TSL", "", 250) : GameAsset
+        let archer = Chain.create("Archer", "ARCH", "", 30) : GameAsset
+        let robot = Chain.create("robot", "ROBO", "", 60) : GameAsset
+        let valkyriee = Chain.create("valkyriee", "VLK", "", 50) : GameAsset
+        let aureus_token = Chain.create("Aureus", 0, "AU", Some(10000)) : Aureus
+        aureus_token.transfer(Call.caller, 10000)
+        { owner = Call.caller, aureus = aureus_token, assets_count = 2, assets = { [0] = town_hall, [1] = miner, [2] = cannon, [3] = xbow, [4] = tesla, [5] = archer, [6] = robot, [7] = valkyriee }, game_state = {}, asset_cordinates = {}, user_count = 0, users = {}, war_state = {}, war_result_oracle = None }
+    
+    entrypoint get_total_assets() : int =
+        state.assets_count
+    
+    stateful entrypoint update_building_cordinates(data : asset_cordinates_map_internal) =
+        require(Map.member(0, data) ,"townhall not placed")
+        List.foreach(Map.to_list(data), handle_cordinates_loop)
+        put(state{asset_cordinates[Call.caller] = data})
+    
+    function handle_cordinates_loop(data : asset_kv) =
+        let game_asset : GameAsset = get_asset(Pair.fst(data))
+        require(game_asset.balance_of(Call.caller)>=List.length(Pair.snd(data)), "data is malformed")
+    
+    entrypoint get_buildings_data(addr: address) : asset_cordinates_map_internal =
+        Map.lookup_default(addr, state.asset_cordinates, {})
+    
+    entrypoint get_my_data() : (list(int) * int * asset_cordinates_map_internal) =
+        let assets_balnce : list(int) = List.map(map_fetch_balance, Map.to_list(state.assets))
+        let aureus_balance : int = 
+            switch(state.aureus.balance(Call.caller))
+                None    => 0
+                Some(n) => n
+        let building_data : asset_cordinates_map_internal = Map.lookup_default(Call.caller, state.asset_cordinates, {})
+        (assets_balnce, aureus_balance, building_data)
+
+    function map_fetch_balance(data : asset_id_instance) : int = 
+        Pair.snd(data).balance_of(Call.caller)
+    
+    stateful entrypoint start_war() : war_data =
+        require(Option.is_some(state.war_result_oracle), "Oracle is not set")
+        require(Oracle.check(Option.force(state.war_result_oracle)), "Oracle expired")
+        require(Map.lookup_default( Call.caller, state.game_state, false), "GAME_NOT_STARTED")
+        let random_num : int = generate_random_num() mod state.user_count
+        let apponent_addr : address = 
+            switch(Map.lookup(random_num, state.users))
+                None    => abort("no opponent available retry again")
+                Some(n) => n
+        require(apponent_addr != Call.caller, "failed to find opponent retry again")
+        let war_id : string = generate_random_id(apponent_addr)
+        let war_record = { attacker = Call.caller, defense = apponent_addr, is_finished = false}
+        put(state{war_state[war_id] = war_record})
+        (war_id , apponent_addr, Map.lookup_default(apponent_addr, state.asset_cordinates, {}))
+    
+    payable stateful entrypoint end_war(id: string) : oracle_query(war_oracle_question, war_oracle_result) =
+        require(Option.is_some(state.war_result_oracle), "Oracle is not set")
+        require(Oracle.check(Option.force(state.war_result_oracle)), "Oracle expired")
+        let war_detail : war = switch(Map.lookup(id, state.war_state))
+            None => abort("game id not found")
+            Some(war) => war
+        require(!war_detail.is_finished, "war already ended")
+        require(Call.caller==war_detail.attacker, "attacker can only end war")
+        put(state{ war_state[id].is_finished = true })
+        let wq : war_oracle_question = { game_id = id}
+        Oracle.query(Option.force(state.war_result_oracle), wq, Call.value, RelativeTTL(400), RelativeTTL(200))
+    
+    stateful entrypoint respond_query(sig: signature, query_id : oracle_query(war_oracle_question, war_oracle_result), res: war_oracle_result) =
+        require(Option.is_some(state.war_result_oracle), "Oracle is not set")
+        require(Oracle.check(Option.force(state.war_result_oracle)), "Oracle expired") 
+        Oracle.respond(signature = sig, Option.force(state.war_result_oracle), query_id, res)
+
+    stateful entrypoint claim_reward(query_id: oracle_query(war_oracle_question, war_oracle_result)) = 
+        require(Option.is_some(state.war_result_oracle), "Oracle is not set")
+        require(Oracle.check(Option.force(state.war_result_oracle)), "Oracle expired")
+        let ans_data : war_oracle_result = switch(Oracle.get_answer(Option.force(state.war_result_oracle), query_id))
+            None => abort("Query Not Found Or Resolved")
+            Some(x) => x
+        let attacker : address = switch(Map.lookup(ans_data.game_id, state.war_state))
+            None => abort("GameId not found")
+            Some(x) => x.attacker
+        let destroyed_building : int = ans_data.destroyed_building
+        state.aureus.mint(Call.caller, destroyed_building*20)
+
+    stateful entrypoint register_oracle(sig: signature, operator: address,  qfee : int, ttl  : Chain.ttl) : oracle(war_oracle_question, war_oracle_result) = 
+        require_owner()
+        let reg_oracle = Oracle.register(operator, qfee, ttl, signature = sig) : oracle(war_oracle_question, war_oracle_result) 
+        put(state{ war_result_oracle = Some(reg_oracle) })
+        reg_oracle
+
+    stateful payable entrypoint extend_oracle(sign : signature, ttl  : Chain.ttl) =
+        let war_oracle : oracle(war_oracle_question, war_oracle_result) = switch(state.war_result_oracle)
+            None => abort("Oracal Not Set")
+            Some(orc) => orc
+        Oracle.extend(war_oracle , signature = sign, ttl)
+        
+    stateful entrypoint add_asset(name : string, symbol: string, token_uri: string, token_price: int) : address = 
+        require_owner()
+        let new_game_asset = Chain.create(name, symbol, token_uri, token_price) : GameAsset
+        let asset_id : int = state.assets_count
+        put(state{ assets_count @ ac = asset_id + 1,  assets[asset_id] =  new_game_asset })
+        new_game_asset.address
+
+    stateful entrypoint mint(asset_id : int, to : address) = 
+        require(asset_id != 0, "townhall is not mintable externally")
+        let game_asset : GameAsset = get_asset(asset_id)
+        let asset_price : int = game_asset.get_price()
+        require(Option.default(0, state.aureus.balance(Call.caller))>= game_asset.get_price(), "low aureus balance")
+        state.aureus.burn(asset_price)
+        let next_token_id : int = game_asset.get_next_tokenid()
+        game_asset.mint(next_token_id, to)
+    
+    stateful entrypoint start_game() =
+        require(!Map.lookup_default( Call.caller, state.game_state, false), "GAME_ALREADY_STARTED")
+        _mint(0, Call.caller)
+        state.aureus.mint(Call.caller, 2000)
+        let currUser : int = state.user_count 
+        put(state{ game_state[Call.caller] = true, users[currUser] = Call.caller, user_count @ uc = uc + 1 })
+
+    entrypoint get_asset_address(asset_id : int) : address =
+        get_asset(asset_id).address
+    
+    entrypoint get_aureus_address() : address =
+        state.aureus.address
+    
+    entrypoint is_game_started() : bool =
+        Map.lookup_default(Call.caller, state.game_state, false)
+    
+    stateful function _mint(asset_id : int, to : address) =
+        let game_asset : GameAsset = get_asset(asset_id)
+        let next_token_id : int = game_asset.get_next_tokenid()
+        game_asset.mint(next_token_id, to)
+    
+    function require_owner() =
+        require(Call.caller == state.owner, "ONLY_OWNER_CALL_ALLOWED")
+    
+    function get_asset(asset_id : int) : GameAsset =
+        let option_game_asset : option(GameAsset) = Map.lookup(asset_id, state.assets)
+        require(Option.is_some(option_game_asset), "ASSET_NOT_EXSIST")
+        Option.force(option_game_asset)
+    
+    function generate_random_num() : int =
+        get_block_hash_bytes_as_int() - Chain.timestamp
+    
+    function generate_random_id(apponent_addr: address) : string =
+        let r1 : string = String.concat(get_block_hash_bytes_as_str(), Int.to_str(Chain.timestamp))
+        let r2 : string = String.concat(r1, Address.to_str(Call.caller))
+        String.concat(r2, Address.to_str(apponent_addr))
+    
+    function get_block_hash_bytes_as_str() : string =
+        switch(Chain.block_hash(Chain.block_height - 1))
+            None => abort("blockhash not found")
+            Some(bytes) => Bytes.to_str(bytes)
+
+    function get_block_hash_bytes_as_int() : int =
+        switch(Chain.block_hash(Chain.block_height - 1))
+            None => abort("blockhash not found")
+            Some(bytes) => Bytes.to_int(bytes)
+        
